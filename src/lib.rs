@@ -1,18 +1,63 @@
-//! **dhoni** is a crate for converting Bengali text into their phonetic counterpart.
-//! 
-//! It's output doesn't strictly follow the Avro Phonetic specification, but tries to be
-//! compatible with Avro Phonetic's scheme.
-//! 
-//! # Example: Converting a Bengali word
+//! **dhoni** converts Bengali text into a phonetic Roman counterpart.
+//!
+//! It supports multiple transliteration conventions via [`Mode`]. The output
+//! is ASCII lowercase and aims to be compatible with common phonetic schemes
+//! (Avro, Khipro) rather than a lossless round-trip.
+//!
+//! # Examples
 //! ```rust
-//! use dhoni::convert_to_phonetic;
-//! 
-//! let banglish = convert_to_phonetic("আমি");
-//! assert_eq!(banglish, "ami");
+//! use dhoni::{convert_to_phonetic, convert_to_phonetic_variants, Mode};
+//!
+//! assert_eq!(convert_to_phonetic("আমি", Mode::Avro), "ami");
+//! assert_eq!(convert_to_phonetic("চাঁদ", Mode::Khipro), "ca/d");
 //! ```
-//! 
 
-fn letter_map(letter: char) -> Option<&'static str> {
+mod avro;
+mod khipro;
+
+/// Transliteration convention selector.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Mode {
+    /// Avro Phonetic-compatible spelling.
+    Avro,
+    /// Khipro layout spelling (see khipro-m17n): candrabindu `ঁ` → `/`,
+    /// visarga-like `ৎ` → `t/`, and virama joins are preserved as-is.
+    Khipro,
+}
+
+const NUKTA: char = '\u{09BC}';
+
+/// A consonant that can carry an implicit vowel.
+fn is_bengali_consonant(c: char) -> bool {
+    matches!(c, '\u{0995}'..='\u{09B9}' | 'ড়' | 'ঢ়' | 'য়')
+}
+
+/// Precomposed nukta letters are composition-excluded, so text may carry
+/// `ড` + nukta instead of `ড়`. Fold that pair onto its phonetic spelling.
+fn nukta_letter(base: char) -> Option<&'static str> {
+    match base {
+        'ড' | 'ঢ' => Some("r"),
+        'য' => Some("y"),
+        _ => None,
+    }
+}
+
+/// Consonant conjunct special cases: (first, second after virama) → spelling.
+const SPECIAL_CONJUNCTS: &[(char, char, &str)] = &[
+    ('ক', 'ষ', "kkh"), // ক্ষ
+];
+
+fn special_conjunct(first: char, second: char) -> Option<&'static str> {
+    for &(a, b, out) in SPECIAL_CONJUNCTS {
+        if a == first && b == second {
+            return Some(out);
+        }
+    }
+    None
+}
+
+/// The shared Bengali letter inventory.
+fn base_letter_map(letter: char) -> Option<&'static str> {
     match letter {
         // Numbers
         '০' => Some("0"),
@@ -32,7 +77,7 @@ fn letter_map(letter: char) -> Option<&'static str> {
         'ঈ' => Some("i"),
         'উ' => Some("u"),
         'ঊ' => Some("u"),
-        'ঋ' => Some("rri"),
+        'ঋ' => Some("ri"),
         'এ' => Some("e"),
         'ঐ' => Some("oi"),
         'ও' => Some("o"),
@@ -43,7 +88,7 @@ fn letter_map(letter: char) -> Option<&'static str> {
         'ী' => Some("i"),
         'ু' => Some("u"),
         'ূ' => Some("u"),
-        'ৃ' => Some("rri"),
+        'ৃ' => Some("ri"),
         'ে' => Some("e"),
         'ৈ' => Some("oi"),
         'ো' => Some("o"),
@@ -92,50 +137,92 @@ fn letter_map(letter: char) -> Option<&'static str> {
     }
 }
 
-/// Converts input text into their Bengali phonetic counterpart.
-pub fn convert_to_phonetic(input: &str) -> String {
+/// The knobs a transliteration scheme can tune
+pub(crate) trait Scheme {
+    fn spelling(&self, letter: char) -> Option<&'static str>;
+
+    /// Insert the implicit `o` an Avro typist writes between consonants.
+    fn insert_inherent_o(&self, _chars: &[char], _next: usize) -> bool {
+        false
+    }
+
+    /// Avro's alternate style treats the `্য` glide as silent.
+    fn suppress_z_fola(&self) -> bool {
+        false
+    }
+}
+
+fn emit_inherent_o(out: &mut String, chars: &[char], next: usize, scheme: &impl Scheme) {
+    if scheme.insert_inherent_o(chars, next) {
+        out.push('o');
+    }
+}
+
+/// Shared conversion engine
+pub(crate) fn convert_with(input: &str, scheme: &impl Scheme) -> String {
     let mut converted = String::with_capacity(input.len());
-    let vec_str: Vec<char> = input.chars().collect();
+    let chars: Vec<char> = input.chars().collect();
 
     let mut index = 0;
-    while index < vec_str.len() {
-        // Zukta Kha
-        if vec_str[index] == 'ক' {
-            if let Some(c) = vec_str.get(index + 1) {
-                if *c == '্' {
-                    if let Some(c) = vec_str.get(index + 2) {
-                        if *c == 'ষ' {
-                            converted.push_str("kkh");
-                            index += 3;
-                            continue;
-                        }
+    while index < chars.len() {
+        let current = chars[index];
+
+        if chars.get(index + 1) == Some(&'্') {
+            if let Some(after) = chars.get(index + 2) {
+                if let Some(out) = special_conjunct(current, *after) {
+                    converted.push_str(out);
+                    index += 3;
+                    emit_inherent_o(&mut converted, &chars, index, scheme);
+                    continue;
+                }
+            }
+        }
+
+        if chars.get(index + 1) == Some(&NUKTA) {
+            if let Some(out) = nukta_letter(current) {
+                converted.push_str(out);
+                index += 2;
+                emit_inherent_o(&mut converted, &chars, index, scheme);
+                continue;
+            }
+        }
+
+        if current == '্' {
+            match chars.get(index + 1) {
+                Some('ব') => {
+                    converted.push('w');
+                    index += 2;
+                    emit_inherent_o(&mut converted, &chars, index, scheme);
+                    continue;
+                }
+                Some('য') => {
+                    if !scheme.suppress_z_fola() {
+                        converted.push('y');
                     }
-                }
-            }
-        }
-
-        if vec_str[index] == '্' {
-            if let Some(c) = vec_str.get(index + 1) {
-                // B Fola
-                if *c == 'ব' {
-                    converted.push_str("w");
                     index += 2;
+                    emit_inherent_o(&mut converted, &chars, index, scheme);
                     continue;
-                } else if *c == 'য' {
-                    // Z Fola
-                    converted.push_str("y");
-                    index += 2;
+                }
+                // Both schemes drop the virama mark and let the following
+                // consonant flow through; Khipro's join behaviour is simply
+                // the absence of an implicit-vowel insertion.
+                _ => {
+                    index += 1;
                     continue;
                 }
             }
         }
 
-        if let Some(c) = letter_map(vec_str[index]) {
-            converted.push_str(c);
+        let spelling = scheme.spelling(current).unwrap_or("");
+        converted.push_str(spelling);
+        if is_bengali_consonant(current) {
+            emit_inherent_o(&mut converted, &chars, index + 1, scheme);
         }
 
-        if vec_str[index].is_ascii_whitespace() || vec_str[index].is_ascii_punctuation() {
-            converted.push(vec_str[index]);
+        if spelling.is_empty() && (current.is_ascii_whitespace() || current.is_ascii_punctuation())
+        {
+            // Includes the Khipro `/` layout marker.
+            converted.push(current);
         }
 
         index += 1;
@@ -144,31 +231,105 @@ pub fn convert_to_phonetic(input: &str) -> String {
     converted
 }
 
+/// Converts input text using the given transliteration [`Mode`].
+///
+/// This is the canonical spelling: no optional implicit vowels are inserted.
+pub fn convert_to_phonetic(input: &str, mode: Mode) -> String {
+    match mode {
+        Mode::Avro => avro::convert(input),
+        Mode::Khipro => khipro::convert(input),
+    }
+}
+
+/// Returns plausible phonetic forms for one Bangla word.
+///
+/// Avro mode returns the canonical spelling plus alternates that cover common
+/// Avro-style typings: the implicit `o` many typists insert between
+/// consonants (`kortobbo` for কর্তব্য) and aspirated/silent-glide spellings
+/// (`chino` for চিনো, `kortobbo` for কর্তব্য). Khipro mode additionally
+/// returns a trailing-`/` variant for words containing a virama (`্`),
+/// because Khipro typists can suppress a virama with `/` (e.g. `ks/` → কস
+/// vs `ks` → ক্স).
+pub fn convert_to_phonetic_variants(input: &str, mode: Mode) -> Vec<String> {
+    let mut forms = match mode {
+        Mode::Avro => avro::variants(input),
+        Mode::Khipro => khipro::variants(input),
+    };
+    forms.sort();
+    forms.dedup();
+    forms
+}
+
 #[cfg(test)]
 mod tests {
-    use super::convert_to_phonetic;
+    use super::*;
 
     #[test]
     fn numbers() {
-        assert_eq!(convert_to_phonetic("০১২৩৪৫৬৭৮৯"), "0123456789");
+        assert_eq!(convert_to_phonetic("০১২৩৪৫৬৭৮৯", Mode::Avro), "0123456789");
     }
 
     #[test]
     fn word() {
-        assert_eq!(convert_to_phonetic("আমি"), "ami");
-        assert_eq!(convert_to_phonetic("ঋতু"), "rritu");
-        assert_eq!(convert_to_phonetic("ওষুধ"), "oxudh");
-        assert_eq!(convert_to_phonetic("সংখ্যা"), "sngkhya");
-        assert_eq!(convert_to_phonetic("ক্ষুধা"), "kkhudha");
-        assert_eq!(convert_to_phonetic("বিশ্ব"), "bisw");
-        assert_eq!(convert_to_phonetic("পদ্ম"), "pdm");
-        assert_eq!(convert_to_phonetic("জিতেন্দ্র"), "jitendr");
-        assert_eq!(convert_to_phonetic("বিদ্বান"), "bidwan");
-        assert_eq!(convert_to_phonetic("চাঁদ"), "cad");
+        assert_eq!(convert_to_phonetic("আমি", Mode::Avro), "ami");
+        assert_eq!(convert_to_phonetic("ঋতু", Mode::Avro), "ritu");
+        assert_eq!(convert_to_phonetic("ওষুধ", Mode::Avro), "oxudh");
+        assert_eq!(convert_to_phonetic("সংখ্যা", Mode::Avro), "sngkhya");
+        assert_eq!(convert_to_phonetic("ক্ষুধা", Mode::Avro), "kkhudha");
+        assert_eq!(convert_to_phonetic("বিশ্ব", Mode::Avro), "bisw");
+        assert_eq!(convert_to_phonetic("পদ্ম", Mode::Avro), "pdm");
+        assert_eq!(convert_to_phonetic("জিতেন্দ্র", Mode::Avro), "jitendr");
+        assert_eq!(convert_to_phonetic("বিদ্বান", Mode::Avro), "bidwan");
+        assert_eq!(convert_to_phonetic("চাঁদ", Mode::Avro), "cad");
     }
 
     #[test]
     fn sentence() {
-        assert_eq!(convert_to_phonetic("আমাদের ভালোবাসা হয়ে গেল ঘাস, খেয়ে গেল গরু আর দিয়ে গেল বাঁশ"), "amader bhalobasa hye gel ghas, kheye gel gru ar diye gel bas");
+        assert_eq!(
+            convert_to_phonetic(
+                "আমাদের ভালোবাসা হয়ে গেল ঘাস, খেয়ে গেল গরু আর দিয়ে গেল বাঁশ",
+                Mode::Avro
+            ),
+            "amader bhalobasa hye gel ghas, kheye gel gru ar diye gel bas"
+        );
+    }
+
+    #[test]
+    fn conjuncts_are_concatenated_letters() {
+        let cases = [
+            ("স্ত", "st"),
+            ("ক্ত", "kt"),
+            ("ঞ্জ", "ngj"),
+            ("ম্প", "mp"),
+            ("ল্ল", "ll"),
+            ("স্য", "sy"),
+            ("দ্ধ", "ddh"),
+            ("ক্ষ", "kkh"),
+            ("ত্র", "tr"),
+        ];
+        for (bangla, roman) in cases {
+            assert_eq!(
+                convert_to_phonetic(bangla, Mode::Avro),
+                roman,
+                "conjunct {bangla}"
+            );
+        }
+    }
+
+    #[test]
+    fn canonical_forms_are_ascii_lowercase() {
+        let letters = "অআইঈউঊঋএঐওঔকখগঘঙচছজঝঞটঠডঢণতথদধানপফবভমযরলশষসহড়ঢ়য়ৎংঃঁ";
+        for mode in [Mode::Avro, Mode::Khipro] {
+            for letter in letters.chars() {
+                for form in convert_to_phonetic_variants(&letter.to_string(), mode) {
+                    assert!(
+                        form.bytes()
+                            .all(|b| b.is_ascii_lowercase() || b == b'/' || b.is_ascii_digit()),
+                        "{}",
+                        "non-canonical form {form:?} for {letter:?}"
+                    );
+                }
+            }
+        }
     }
 }
