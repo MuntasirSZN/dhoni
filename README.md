@@ -14,12 +14,12 @@ dhoni = "0.1"
 
 ## Example
 ```rust
-use dhoni::{convert_to_phonetic, Mode};
+use dhoni::{avro, khipro};
 
-let banglish = convert_to_phonetic("আমি", Mode::Avro);
+let banglish = avro::convert("আমি");
 assert_eq!(banglish, "ami");
 
-let khipro = convert_to_phonetic("চাঁদ", Mode::Khipro);
+let khipro = khipro::convert("চাঁদ");
 assert_eq!(khipro, "ca/d");
 ```
 
