@@ -18,14 +18,33 @@ fn special_conjunct(first: char, second: char) -> Option<&'static str> {
 
 const NUKTA: char = '\u{09BC}';
 
-/// Precomposed nukta letters are composition-excluded, so text may carry
-/// `ড` + nukta instead of `ড়`. Fold that pair onto its phonetic spelling.
-fn nukta_letter(base: char) -> Option<&'static str> {
+/// `ড়`, `ঢ়` and `য়` are composition-excluded, so text may spell them as a
+/// base letter plus a nukta.
+fn precomposed_nukta(base: char) -> Option<char> {
     match base {
-        'ড' | 'ঢ' => Some("r"),
-        'য' => Some("y"),
+        'ড' => Some('\u{09DC}'), // ড়
+        'ঢ' => Some('\u{09DD}'), // ঢ়
+        'য' => Some('\u{09DF}'), // য়
         _ => None,
     }
+}
+
+/// Normalizes decomposed nukta letters (`ড` + nukta) to their precomposed
+/// form so the character table alone decides the spelling.
+fn normalize_nukta(input: &str) -> Vec<char> {
+    let mut normalized = Vec::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+    while let Some(current) = chars.next() {
+        if chars.peek() == Some(&NUKTA) {
+            if let Some(precomposed) = precomposed_nukta(current) {
+                normalized.push(precomposed);
+                chars.next();
+                continue;
+            }
+        }
+        normalized.push(current);
+    }
+    normalized
 }
 
 fn letter_map(letter: char) -> Option<&'static str> {
@@ -110,7 +129,7 @@ fn letter_map(letter: char) -> Option<&'static str> {
 
 fn convert_with(input: &str) -> String {
     let mut converted = String::with_capacity(input.len());
-    let chars: Vec<char> = input.chars().collect();
+    let chars = normalize_nukta(input);
 
     let mut index = 0;
     while index < chars.len() {
@@ -123,14 +142,6 @@ fn convert_with(input: &str) -> String {
                     index += 3;
                     continue;
                 }
-            }
-        }
-
-        if chars.get(index + 1) == Some(&NUKTA) {
-            if let Some(out) = nukta_letter(current) {
-                converted.push_str(out);
-                index += 2;
-                continue;
             }
         }
 
@@ -216,6 +227,22 @@ mod tests {
         assert_eq!(convert("জিতেন্দ্র"), "jitendr");
         assert_eq!(convert("বিদ্বান"), "bidwan");
         assert_eq!(convert("চাঁদ"), "ca/d");
+    }
+
+    #[test]
+    fn decomposed_nukta_matches_precomposed() {
+        // ড/ঢ/য + nukta normalize to ড়/ঢ়/য় before spelling.
+        let pairs = [
+            ("\u{09A1}\u{09BC}", "\u{09DC}"), // ড + nukta, ড়
+            ("\u{09A2}\u{09BC}", "\u{09DD}"), // ঢ + nukta, ঢ়
+            ("\u{09AF}\u{09BC}", "\u{09DF}"), // য + nukta, য়
+        ];
+        for (decomposed, precomposed) in pairs {
+            assert_eq!(convert(decomposed), convert(precomposed), "{decomposed:?}");
+        }
+        assert_eq!(convert("\u{09A1}\u{09BC}"), "r");
+        assert_eq!(convert("\u{09A2}\u{09BC}"), "r");
+        assert_eq!(convert("\u{09AF}\u{09BC}"), "y");
     }
 
     #[test]
