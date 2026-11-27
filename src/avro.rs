@@ -2,6 +2,8 @@
 //!
 //! This module provides transliteration according to the Avro Phonetic convention.
 
+use crate::utils::{normalize_nukta, NUKTA};
+
 /// Consonant conjunct special cases: (first, second after virama) → spelling.
 const SPECIAL_CONJUNCTS: &[(char, char, &str)] = &[
     ('ক', 'ষ', "kkh"), // ক্ষ
@@ -19,37 +21,6 @@ fn special_conjunct(first: char, second: char) -> Option<&'static str> {
 /// A consonant that can carry an implicit vowel.
 fn is_bengali_consonant(c: char) -> bool {
     matches!(c, '\u{0995}'..='\u{09B9}' | 'ড়' | 'ঢ়' | 'য়')
-}
-
-const NUKTA: char = '\u{09BC}';
-
-/// `ড়`, `ঢ়` and `য়` are composition-excluded, so text may spell them as a
-/// base letter plus a nukta.
-fn precomposed_nukta(base: char) -> Option<char> {
-    match base {
-        'ড' => Some('\u{09DC}'), // ড়
-        'ঢ' => Some('\u{09DD}'), // ঢ়
-        'য' => Some('\u{09DF}'), // য়
-        _ => None,
-    }
-}
-
-/// Normalizes decomposed nukta letters (`ড` + nukta) to their precomposed
-/// form so the character table alone decides the spelling.
-fn normalize_nukta(input: &str) -> Vec<char> {
-    let mut normalized = Vec::with_capacity(input.len());
-    let mut chars = input.chars().peekable();
-    while let Some(current) = chars.next() {
-        if chars.peek() == Some(&NUKTA) {
-            if let Some(precomposed) = precomposed_nukta(current) {
-                normalized.push(precomposed);
-                chars.next();
-                continue;
-            }
-        }
-        normalized.push(current);
-    }
-    normalized
 }
 
 fn letter_map(letter: char) -> Option<&'static str> {

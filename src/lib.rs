@@ -19,3 +19,5 @@
 
 pub mod avro;
 pub mod khipro;
+
+mod utils;
